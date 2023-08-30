@@ -1,0 +1,242 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * This file checks ssl expiry for a bunch of domains from the default or a given hosts file, or STDIN (one domain per line)
+ * Results are cached for a day.
+ * See help() (or call with -?) for more.
+**/
+
+// change these as needed
+const DAYS_1       = 30; // shows orange
+const DAYS_2       = 14; // shows red or something
+const HOSTS_FILE = __DIR__.'/config/hosts';
+const CACHE_FILE = __DIR__.'/cache/certs';
+const CONFIG_FILE = "/home/nemo/.config/certs.conf"; // ini file with "1.2.3.4 = servername" entries, optional
+// /Config
+
+
+define('QUIET', in_array('-q', $argv));
+define('SHOW_ALL_INFO', ! QUIET and in_array('-a', $argv));
+define('COLOR', posix_isatty(STDOUT) or in_array('-c', $argv)); // force color output even when piping to a file or other process
+
+$file       = HOSTS_FILE;
+$cache_file = CACHE_FILE;
+$known_ips  = is_readable(CONFIG_FILE) ? parse_ini_file(CONFIG_FILE) : [];
+
+if (in_array(@$argv[1], ['-?', '-h', '--help'])) help();
+
+// figure out where to get $hosts_data from
+if (! posix_isatty(STDIN)) {
+    $hosts_data = file_get_contents('php://stdin');
+    $cache_file = '';
+}else{
+    if (isset($argv[1]) && file_exists($argv[1])) {
+        $file = $argv[1];
+        $feedback = "Using hosts file $file\n";
+        echo QUIET ? '' : (COLOR ? "  \e[34;1m$feedback\e[0m" : $feedback);
+        $cache_file = __DIR__.'/cache/certs_'.md5($file);
+        array_shift($argv);
+    }
+    $hosts_data = file_get_contents($file);
+} 
+
+// check for cached results, just show those if applicable
+if (file_exists($cache_file) and date('d', filemtime($cache_file)) == date('d') and ! in_array('-f', $argv) and ! SHOW_ALL_INFO) {
+    $feedback = "Using cached results from $cache_file\n";
+    echo QUIET ? '' : (COLOR ? "  \e[34;1m$feedback\e[0m" : $feedback);
+    $results = json_decode(file_get_contents($cache_file), 1);
+    show_results();
+}
+
+$hosts = array_filter(array_map('trim', explode("\n", trim($hosts_data))), fn($a) => $a && ! str_starts_with($a, '#'));
+if (! $hosts) {
+    fwrite(STDERR, "  \e[31mE: no hosts found in file '$file'\e[0m\n");
+    exit(4);
+}
+
+$queue = msg_get_queue(ftok(__FILE__, 'a'), 0600); # grab a (System V IPC) message queue for the child processes to report back to the parent
+if (! $queue) die("\e[31mQueue init failed!\e[0m\n");
+
+$children = 0;
+
+foreach ($hosts as $host) {
+    $pid = pcntl_fork();
+    
+    if ($pid === -1) {
+        die("\e[31mForking failed.\e[0m\n");
+    }elseif ($pid === 0) {
+        // child: fetch and process cert data
+        try {
+            $item = array_fill_keys(explode(' ', 'host date days ip issuer name_count success'), ''); // init...
+            $item['host'] = $host;
+            unset($pem_lines, $exit_status);
+            $result = exec("echo | openssl s_client -servername $host -connect $host:443 2>/dev/null", $pem_lines, $exit_status);
+            if ($exit_status) {
+                if (count($pem_lines) < 30) {
+                    throw new Exception(join('; ', $pem_lines)."; exit: $exit_status", 1);
+                } // else it's probably just old ssl weirdness...some certs will work fine in the browser but refuse to play nice with cert checkers.
+            }
+            $pem = join("\n", $pem_lines);
+            $cert = openssl_x509_parse($pem, false);
+            $item['date'] = date("Y-m-d", $cert['validTo_time_t']);
+            $item['days'] = $days = ceil(($cert['validTo_time_t'] - time()) / (24 * 60 * 60));
+            if ($days <= DAYS_1 or SHOW_ALL_INFO) {
+                $ip = exec("dig +short @8.8.8.8 $host");
+                if ($ip) {
+                    if (isset($known_ips[$ip])) $ip .= " ({$known_ips[$ip]})";
+                    $item['ip'] = $ip;
+                }
+                $item['issuer'] = $cert['issuer']['organizationName'] ?? '(unknown)';
+                $names = substr_count($cert['extensions']['subjectAltName'], 'DNS');
+                if ($names > 1) $item['name_count'] = $names;
+            }
+            $item['success'] = true;
+            $res = msg_send($queue, 1, $item);
+        }catch(Exception $e) {
+            $errMsg  = $e->getMessage();
+            $errCode = $e->getCode();
+            msg_send($queue, 1, ['success'=>false, 'host'=>$host, 'error'=>"$errMsg ($errCode)"]);
+        }
+        exit;
+    }else{
+        // parent: if we're here, it forked, and if it forked, there's a new child process.
+        $children++;
+    }
+}
+
+# grab all results from message queue
+$results = [];
+for ($i=0; $i < $children; $i++) {
+    msg_receive($queue, 1, $type, 4096, $host_data);
+    $results[] = $host_data;
+}
+msg_remove_queue($queue);
+
+// sort results as they were in the config file..
+$flip_hosts = array_flip($hosts);
+usort($results, fn($a, $b) => $flip_hosts[$a['host']] <=> $flip_hosts[$b['host']]);
+// ..and cache them (unless input was STDIN -> $cache_file was reset)
+if ($cache_file and ! file_put_contents($cache_file, json_encode($results))) {
+    fwrite(STDERR, "  \e[31mE: failed writing cache file: '$cache_file'\e[0m\n");
+}
+
+// display output
+show_results();
+
+// == Functions ================
+
+function show_results() {
+    # A -s, -t or -i (_after_ the file if any) will sort results by name, time or IP address.
+    # -q will only show the ones that need updating.
+    global $results;
+    $errors = [];
+    foreach ($results as $key => $result) {
+        if (! $result['success']) { // move errors to separate array
+            $errors[] = $result;
+            unset($results[$key]);
+        }
+        unset($results[$key]['success']);
+    }
+    if (! SHOW_ALL_INFO)  trim_results($results); // just in case results from -a were cached (issuer, ip etc for all hosts)
+    if (QUIET)  $results = array_filter($results, fn($a) => strlen($a['issuer'])); // only show results that need looking at
+    if (posix_isatty(STDOUT) or COLOR) {
+        color_results($results);
+    }
+    sort_results($results);
+    echo indent(columns($results))."\n"; // display \o/
+    if (count($errors)) { // show errors
+        echo COLOR ? "\e[1;4mErrors:\e[0m\n" : "Errors\n";
+        foreach ($errors as $error) {
+            $label = $error['host'].', error: '.$error['error']."\n";
+            echo COLOR ? "  \e[31;1m$label\e[0m" : $label;
+        }
+    }
+    die();
+}
+function sort_results(&$results){
+    $sort = set_sort(); // file (=default), name, time, ip
+    if (in_array($sort, ['host', 'days', 'ip'])) {
+        usort($results, fn($a, $b) => $a[$sort] <=> $b[$sort]);
+    }
+}
+
+function set_sort() {
+    global $argv;
+    $sort = 'file';
+    if (in_array('-s', $argv)) $sort = 'host';
+    if (in_array('-t', $argv)) $sort = 'days';
+    if (in_array('-i', $argv)) $sort = 'ip';
+    return $sort;
+}
+
+function trim_results(&$results) {
+    foreach ($results as &$result) {
+        if ($result['days'] > DAYS_1) {
+            $result['ip'] = $result['issuer'] = $result['name_count'] = '';
+        }
+    }
+}
+
+function color_results(&$results) {
+    foreach ($results as &$result) {
+        if ($result['days'] <= DAYS_2) {
+            $result['days'] = "\e[38;5;196m".$result['days']."\e[0m";
+        }elseif ($result['days'] <= DAYS_1) {
+            $result['days'] = "\e[38;5;208m".$result['days']."\e[0m";
+        }
+    }
+}
+
+function help() {
+    global $file;
+    echo <<<HELP
+      Checks hosts from $file, or file from first argument, or STDIN, for SSL certificate validity/dates.
+      Results for hosts files are cached for the day.
+      Domains that will expire within 30 days show the IP address (optionally server name), the issuer and the number
+        of domains on the certificate if there are multiple.
+      Flags:
+       -s  sort by name (default is order in file)
+       -t  .. by time
+       -i  .. by IP (only shown for certs that will run out)
+       -q  only show hosts requiring attention, and any errors (trumps -a)
+       -a  show all info regardless of status (IP, cert issuer, nr of alt names), implies -f
+       -f  force check (ignore and overwrite cached results)
+       -c  use colors also when piping/redirecting output
+    HELP;
+    die();
+}
+
+function columns($array, $keys=false, $delim='  ') {
+    $colorCodesPattern = "/\e[[][0-9]*m/";
+    if (! is_array($array)) $array = explode("\n", $array);
+    // prepend output with row of field names, by inserting a row of them at index 0.
+    // (this probably doesn't work for string input or single-dim arrays)
+    if ($keys and is_string(key(current($array)))) {
+        $keys = array_keys(current($array));
+        array_unshift($array, array_combine($keys, $keys));
+    }
+    $item_count = 0;
+    $lengths = [];
+    foreach ($array as &$row) {
+        if (! is_array($row)) $row = preg_split("/\s+/", $row);
+        $item_count = max($item_count, count($row));
+        foreach ($row as $key => $value) {
+            $lineLength    = mb_strlen(preg_replace($colorCodesPattern, '', $value), 'UTF-8');
+            $lengths[$key] = max($lineLength, @$lengths[$key]);
+        }
+    }
+    unset($row);
+    $out = '';
+    foreach ($array as $row) {
+        foreach ($row as $key => $value) {
+            $out .= $value . str_repeat(' ', $lengths[$key] - mb_strlen(preg_replace($colorCodesPattern, '', $value))) . $delim;
+        }
+        $out = substr($out, 0, -strlen($delim)) . "\n";
+    }
+    return substr($out, 0, -1);
+}
+
+function indent($str, $prefix='  ') {
+    return $prefix . str_replace("\n", "\n$prefix", $str);
+}
