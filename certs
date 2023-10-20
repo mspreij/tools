@@ -8,7 +8,7 @@
 **/
 
 // change these as needed
-const DAYS_1       = 30; // shows orange
+const DAYS_1       = 28; // shows orange
 const DAYS_2       = 14; // shows red or something
 const HOSTS_FILE = __DIR__.'/config/hosts';
 const CACHE_FILE = __DIR__.'/cache/certs';
@@ -25,6 +25,8 @@ $cache_file = CACHE_FILE;
 $known_ips  = is_readable(CONFIG_FILE) ? parse_ini_file(CONFIG_FILE) : [];
 
 if (in_array(@$argv[1], ['-?', '-h', '--help'])) help();
+
+test_requirements();
 
 // figure out where to get $hosts_data from
 if (! posix_isatty(STDIN)) {
@@ -49,9 +51,10 @@ if (file_exists($cache_file) and date('d', filemtime($cache_file)) == date('d') 
     show_results();
 }
 
+// clean/filter hosts from input
 $hosts = array_filter(array_map('trim', explode("\n", trim($hosts_data))), fn($a) => $a && ! str_starts_with($a, '#'));
 if (! $hosts) {
-    fwrite(STDERR, "  \e[31mE: no hosts found in file '$file'\e[0m\n");
+    fwrite(STDERR, "  \e[31mE: no hosts found in input/file '$file'\e[0m\n");
     exit(4);
 }
 
@@ -70,8 +73,12 @@ foreach ($hosts as $host) {
         try {
             $item = array_fill_keys(explode(' ', 'host date days ip issuer name_count success'), ''); // init...
             $item['host'] = $host;
+            $port = 443;
+            if (str_contains($host, ':')) {
+                list($host, $port) = explode(':', $host, 2);
+            }
             unset($pem_lines, $exit_status);
-            $result = exec("echo | openssl s_client -servername $host -connect $host:443 2>/dev/null", $pem_lines, $exit_status);
+            $result = exec("echo | openssl s_client -servername $host -connect $host:$port 2>/dev/null", $pem_lines, $exit_status);
             if ($exit_status) {
                 if (count($pem_lines) < 30) {
                     throw new Exception(join('; ', $pem_lines)."; exit: $exit_status", 1);
@@ -203,8 +210,25 @@ function help() {
        -a  show all info regardless of status (IP, cert issuer, nr of alt names), implies -f
        -f  force check (ignore and overwrite cached results)
        -c  use colors also when piping/redirecting output
+
     HELP;
     die();
+}
+
+function test_requirements() {
+    if (! function_exists('openssl_x509_parse')) {
+        echo "  E: to use the 'openssl_x509_parse' function, PHP requires OpenSSL: https://www.php.net/manual/en/openssl.installation.php\n";
+        die(1);
+    }
+    if (! function_exists('msg_get_queue')) {
+        echo "  E: to use the 'msg_get_queue' function, PHP needs to be compiled with --enable-sysvmsg: https://www.php.net/manual/en/sem.installation.php\n";
+        die(1);
+    }
+    if (! function_exists('pcntl_fork')) {
+        echo "  E: to use the 'pcntl_fork' function, PHP needs to be compiled with --enable-pcntl: https://www.php.net/manual/en/pcntl.installation.php\n";
+        die(1);
+    }
+    return true;
 }
 
 function columns($array, $keys=false, $delim='  ') {
